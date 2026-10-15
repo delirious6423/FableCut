@@ -1598,6 +1598,7 @@ function listenSSE() {
   // Named events: "change" = project/media/library; "profiles" = encoding-profiles.json only
   es.addEventListener("change", () => { noteActivity(); syncFromServer(); });
   es.addEventListener("export", (e) => {
+    noteActivity();
     try { runExportJob(JSON.parse(e.data)); } catch { }
   });
   es.addEventListener("profiles", () => {
@@ -1607,7 +1608,7 @@ function listenSSE() {
     });
   });
   // Legacy default "message" events (old servers that emit bare `data:`)
-  es.onmessage = () => syncFromServer();
+  es.onmessage = () => { noteActivity(); syncFromServer(); };
 }
 /* Pull the server's project if it moved past our revision (an external tool —
    e.g. Claude — wrote it). Our own saves land at our exact local revision, so
@@ -5945,6 +5946,7 @@ async function playSource() {
   audio.ctx.resume();
   state.source.playing = true;
   syncPlayButton();
+  noteActivity();
 }
 function toggleTransportPlay() {
   // Space always resumes forward — drop a reverse / crawl rate left by J or K+L
@@ -8058,6 +8060,7 @@ function play() {
   }
   state.playing = true;
   syncPlayButton();
+  noteActivity();
   syncMedia(); // start active seeks + cut lookahead without waiting a RAF
 }
 function pause() {
@@ -12858,14 +12861,41 @@ let playheadPx = -1;
    (sliders, drags, hover handles) and at 4 fps otherwise, which still picks
    up late seeks, font loads and agent edits. */
 let lastDrawKey = null, lastDrawAt = 0, lastActivity = 0, lastRulerKey = "";
-function noteActivity() { lastActivity = performance.now(); }
+/* An idle editor doesn't need a callback per display refresh either: even an
+   empty requestAnimationFrame loop keeps the compositor ticking at 240 Hz.
+   When nothing moves the loop sleeps on a 4 fps timer, and any input or
+   server event wakes it at once. */
+let loopSleep = 0;
+const IDLE_MS = 250, ACTIVE_MS = 1500, AUDIO_IDLE_MS = 3000;
+function noteActivity() {
+  lastActivity = performance.now();
+  if (loopSleep) { clearTimeout(loopSleep); loopSleep = 0; lastTs = null; requestAnimationFrame(loop); }
+}
+function loopBusy(now) {
+  return state.playing || state.source.playing || state.exporting || state.rendering || state.audioHold ||
+    state.gesture || state.dirtyTimeline || now - lastActivity < ACTIVE_MS;
+}
+/* The audio graph (fx worklets, meter, convolvers) renders silence for as long
+   as its context runs, which costs a realtime thread a quarter of a core.
+   Suspend it a few seconds after the last sound — reverb and delay tails
+   finish first — and let every play path resume it as it already does. */
+let audioIdleSince = 0;
+function idleAudio(now) {
+  const au = runtime.audio;
+  if (!au || au.ctx.state !== "running") { audioIdleSince = 0; return; }
+  let sounding = state.playing || state.source.playing || state.exporting || state.rendering || state.audioHold;
+  if (!sounding) for (const el of runtime.clipEls.values()) if (!el.paused) { sounding = true; break; }
+  if (sounding) { audioIdleSince = 0; return; }
+  if (!audioIdleSince) audioIdleSince = now;
+  else if (now - audioIdleSince > AUDIO_IDLE_MS) { audioIdleSince = 0; au.ctx.suspend().catch(() => { }); }
+}
 for (const ev of ["pointerdown", "pointermove", "pointerup", "wheel", "keydown", "keyup", "input", "change", "dragover", "drop", "resize"])
   window.addEventListener(ev, noteActivity, { capture: true, passive: true });
 function frameDue(now) {
   if (state.exporting) return true;
   const src = isSourceMode(), fps = projectFps();
   const key = (src ? "s" : "p") + Math.floor((src ? state.source.time : state.time) * fps + 1e-6);
-  const gap = now - lastActivity < 1500 ? 1000 / fps : 250;
+  const gap = now - lastActivity < ACTIVE_MS ? 1000 / fps : IDLE_MS;
   if (key === lastDrawKey && now - lastDrawAt < gap - 1) return false;
   lastDrawKey = key; lastDrawAt = now;
   return true;
@@ -12958,7 +12988,9 @@ function loop(ts) {
     els.exportProgress.style.width = pct.toFixed(1) + "%";
     els.exportTitle.textContent = `Exporting… ${pct.toFixed(0)}%`;
   }
-  requestAnimationFrame(loop);
+  idleAudio(ts);
+  if (loopBusy(ts)) requestAnimationFrame(loop);
+  else loopSleep = setTimeout(() => { loopSleep = 0; lastTs = null; requestAnimationFrame(loop); }, IDLE_MS);   // a nap is not playback time
 }
 
 /* ═══════════════════════════ EXPORT ═══════════════════════════ */

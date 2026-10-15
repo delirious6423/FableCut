@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fell behind and an idle editor kept a core busy. It now redraws when the
   playhead reaches a new frame; while paused, at the project rate for a
   moment after any input and at 4 fps otherwise.
+- **An idle editor sleeps.** With nothing playing, the main loop drops from
+  one callback per display refresh to a 4 fps timer (any input or server event
+  wakes it at once), and the audio graph is suspended 3 s after the last
+  sound instead of rendering silence through its worklets forever.
 
 ## [1.14.0] - 2026-10-12
 
