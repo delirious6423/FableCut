@@ -1596,8 +1596,9 @@ function projectJSONHere() {
 function listenSSE() {
   const es = new EventSource("/api/events");
   // Named events: "change" = project/media/library; "profiles" = encoding-profiles.json only
-  es.addEventListener("change", () => syncFromServer());
+  es.addEventListener("change", () => { noteActivity(); syncFromServer(); });
   es.addEventListener("export", (e) => {
+    noteActivity();
     try { runExportJob(JSON.parse(e.data)); } catch { }
   });
   es.addEventListener("profiles", () => {
@@ -1607,7 +1608,7 @@ function listenSSE() {
     });
   });
   // Legacy default "message" events (old servers that emit bare `data:`)
-  es.onmessage = () => syncFromServer();
+  es.onmessage = () => { noteActivity(); syncFromServer(); };
 }
 /* Pull the server's project if it moved past our revision (an external tool —
    e.g. Claude — wrote it). Our own saves land at our exact local revision, so
@@ -5945,6 +5946,7 @@ async function playSource() {
   audio.ctx.resume();
   state.source.playing = true;
   syncPlayButton();
+  noteActivity();
 }
 function toggleTransportPlay() {
   // Space always resumes forward — drop a reverse / crawl rate left by J or K+L
@@ -8058,6 +8060,7 @@ function play() {
   }
   state.playing = true;
   syncPlayButton();
+  noteActivity();
   syncMedia(); // start active seeks + cut lookahead without waiting a RAF
 }
 function pause() {
@@ -8676,9 +8679,161 @@ function hexToRgb(hex) {
   const n = parseInt(String(hex).replace("#", ""), 16) || 0;
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
+/* The same pixel loop as a WebGL2 shader: no getImageData read-back and no
+   per-pixel JS, so a keyed or tinted 1080p layer costs a draw call, not ~20 ms
+   of main thread. The input is staged through a 2D canvas exactly as the CPU
+   path draws it (same resize, same cut-out mask, unpremultiplied on upload
+   like getImageData), so both paths see the same pixels; the CPU loop below
+   stays as the fallback when WebGL2 is unavailable. */
+const pixGL = { tried: false, gl: null, canvas: null, loc: null, stage: null, stageCtx: null, outs: new Map() };
+const PIX_VERT = `#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
+const PIX_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform ivec2 uSize;       // picture size: the buffers only grow, so it sits in their top-left corner
+uniform int uSplit;        // RGB split in pixels (R from x+split, B from x−split)
+uniform int uKey;
+uniform vec2 uKeyC;        // key colour Cb, Cr (0…255)
+uniform vec2 uKeyT;        // tolerance t0, t1 (CbCr distance)
+uniform vec2 uShift;       // temperature (R+, B−), tint (G+), in 0…255 units
+out vec4 o;
+void main() {
+  ivec2 sz = uSize;
+  ivec2 q = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y));   // texture row 0 = top
+  vec4 c = texelFetch(uTex, q, 0);
+  vec3 rgb = c.rgb * 255.0;
+  float a = c.a;
+  if (uSplit > 0) {
+    rgb.r = texelFetch(uTex, ivec2(min(sz.x - 1, q.x + uSplit), q.y), 0).r * 255.0;
+    rgb.b = texelFetch(uTex, ivec2(max(0, q.x - uSplit), q.y), 0).b * 255.0;
+  }
+  if (uKey == 1) {
+    float cb = 128.0 - 0.168736 * rgb.r - 0.331264 * rgb.g + 0.5 * rgb.b;
+    float cr = 128.0 + 0.5 * rgb.r - 0.418688 * rgb.g - 0.081312 * rgb.b;
+    float dist = distance(vec2(cb, cr), uKeyC);
+    if (dist < uKeyT.x) { o = vec4(0.0); return; }
+    if (dist < uKeyT.y) {
+      float k = (dist - uKeyT.x) / (uKeyT.y - uKeyT.x);
+      a *= k;
+      float avg = (rgb.r + rgb.b) * 0.5;   // spill suppression
+      if (rgb.g > avg) rgb.g = rgb.g * k + avg * (1.0 - k);
+    }
+  }
+  rgb += vec3(uShift.x, uShift.y, -uShift.x);
+  rgb = clamp(rgb, 0.0, 255.0) / 255.0;
+  o = vec4(rgb * a, a);
+}`;
+function initPixGL() {
+  if (pixGL.tried) return pixGL.gl;
+  pixGL.tried = true;
+  try {
+    const cv = document.createElement("canvas");
+    const gl = cv.getContext("webgl2", { premultipliedAlpha: true, preserveDrawingBuffer: true, antialias: false, alpha: true });
+    if (!gl) return null;
+    // A software rasterizer (SwiftShader in headless Chrome, llvmpipe) runs the
+    // shader on the CPU anyway, no faster than the loop: keep the loop there.
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    if (info && /swiftshader|llvmpipe|softpipe|software/i.test(gl.getParameter(info.UNMASKED_RENDERER_WEBGL))) return null;
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, PIX_VERT));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, PIX_FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, "aPos");
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+      [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);   // straight alpha, as getImageData returns it
+    const loc = {};
+    for (const n of ["uTex", "uSize", "uSplit", "uKey", "uKeyC", "uKeyT", "uShift"]) loc[n] = gl.getUniformLocation(prog, n);
+    gl.uniform1i(loc.uTex, 0);
+    cv.addEventListener("webglcontextlost", (e) => { e.preventDefault(); pixGL.gl = null; });
+    cv.addEventListener("webglcontextrestored", () => { pixGL.tried = false; });
+    const stage = document.createElement("canvas");   // GPU-backed: no willReadFrequently
+    Object.assign(pixGL, { gl, canvas: cv, loc, stage, stageCtx: stage.getContext("2d") });
+    return gl;
+  } catch (err) {
+    console.warn("[FableCut] WebGL2 pixel pass unavailable, using the CPU path:", err && err.message);
+    return null;
+  }
+}
+/** pixelPass on the GPU; null when WebGL2 isn't usable (the caller falls back). */
+function pixelPassGL(c, p, src, sx, sy, sw, sh, w, h, dw) {
+  const gl = initPixGL();
+  if (!gl) return null;
+  const { stage, stageCtx: g, canvas: cv, loc } = pixGL;
+  // Resizing a canvas reallocates it, and the layers of one frame differ in
+  // size, so the stage and the GL buffer only grow; each clip gets its own
+  // output canvas at its own size, which keeps its size from frame to frame.
+  if (stage.width < w) stage.width = w;
+  if (stage.height < h) stage.height = h;
+  g.clearRect(0, 0, w, h);
+  g.drawImage(src, sx, sy, sw, sh, 0, 0, w, h);
+  const mask = p.bgRemove ? bgSeg.masks.get(c.id) : null;
+  if (mask && mask.width) {
+    g.globalCompositeOperation = "destination-in";
+    g.drawImage(mask, 0, 0, w, h);
+    g.globalCompositeOperation = "source-over";
+  }
+  const doKey = !!p.chromaKey, temp = +p.temperature || 0, tint = +p.tint || 0;
+  const split = Math.round(clamp(+p.rgbSplit || 0, 0, 60) * (w / Math.max(1, dw)));
+  const run = doKey || temp || tint || split > 0;
+  let out = pixGL.outs.get(c.id);
+  if (!out) {
+    if (pixGL.outs.size >= 32) pixGL.outs.delete(pixGL.outs.keys().next().value);
+    out = document.createElement("canvas");
+    pixGL.outs.set(c.id, out);
+  }
+  if (out.width !== w) out.width = w;
+  if (out.height !== h) out.height = h;
+  const o = out.getContext("2d");
+  o.clearRect(0, 0, w, h);
+  if (!run) { o.drawImage(stage, 0, 0, w, h, 0, 0, w, h); return out; }
+  try {
+    if (cv.width < w) cv.width = w;
+    if (cv.height < h) cv.height = h;
+    gl.viewport(0, 0, w, h);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, stage);
+    gl.uniform2i(loc.uSize, w, h);
+    gl.uniform1i(loc.uSplit, split);
+    gl.uniform1i(loc.uKey, doKey ? 1 : 0);
+    if (doKey) {
+      const [kr, kg, kb] = hexToRgb(p.chromaKey);
+      const t0 = clamp(+p.chromaTolerance || 0, 0, 100) * 1.2;
+      gl.uniform2f(loc.uKeyC, 128 - 0.168736 * kr - 0.331264 * kg + 0.5 * kb, 128 + 0.5 * kr - 0.418688 * kg - 0.081312 * kb);
+      gl.uniform2f(loc.uKeyT, t0, t0 + Math.max(1, clamp(+p.chromaSoftness || 0, 0, 100) * 1.2));
+    }
+    gl.uniform2f(loc.uShift, temp * 0.6, tint * 0.5);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    o.drawImage(cv, 0, cv.height - h, w, h, 0, 0, w, h);   // the viewport is the buffer's bottom-left
+    return out;
+  } catch (err) {
+    if (err && err.name === "SecurityError") throw err;   // tainted source: same as getImageData on the CPU path
+    console.warn("[FableCut] pixel pass failed, using the CPU path:", err && err.message);
+    pixGL.gl = null;
+    return null;
+  }
+}
 function pixelPass(c, p, src, sx, sy, sw, sh, dw, dh) {
   const w = Math.max(2, Math.min(Math.round(dw), 1920));
   const h = Math.max(2, Math.min(Math.round(dh), 1920));
+  const viaGL = pixelPassGL(c, p, src, sx, sy, sw, sh, w, h, dw);
+  if (viaGL) return viaGL;
   if (scratch.width !== w) scratch.width = w;
   if (scratch.height !== h) scratch.height = h;
   scratchCtx.clearRect(0, 0, w, h);
@@ -12703,6 +12858,52 @@ async function loadProjectFonts() {
 let lastTs = null;
 let exportWindow = null;
 let playheadPx = -1;
+/* The loop runs at the display's refresh rate (240 Hz on some laptops), but
+   the picture only changes once per project frame. Redraw the program
+   monitor and the playhead-driven panels when the playhead reaches a new
+   frame; while paused, at the project rate for a moment after any input
+   (sliders, drags, hover handles) and at 4 fps otherwise, which still picks
+   up late seeks, font loads and agent edits. */
+let lastDrawKey = null, lastDrawAt = 0, lastActivity = 0, lastRulerKey = "";
+/* An idle editor doesn't need a callback per display refresh either: even an
+   empty requestAnimationFrame loop keeps the compositor ticking at 240 Hz.
+   When nothing moves the loop sleeps on a 4 fps timer, and any input or
+   server event wakes it at once. */
+let loopSleep = 0;
+const IDLE_MS = 250, ACTIVE_MS = 1500, AUDIO_IDLE_MS = 3000;
+function noteActivity() {
+  lastActivity = performance.now();
+  if (loopSleep) { clearTimeout(loopSleep); loopSleep = 0; lastTs = null; requestAnimationFrame(loop); }
+}
+function loopBusy(now) {
+  return state.playing || state.source.playing || state.exporting || state.rendering || state.audioHold ||
+    state.gesture || state.dirtyTimeline || now - lastActivity < ACTIVE_MS;
+}
+/* The audio graph (fx worklets, meter, convolvers) renders silence for as long
+   as its context runs, which costs a realtime thread a quarter of a core.
+   Suspend it a few seconds after the last sound — reverb and delay tails
+   finish first — and let every play path resume it as it already does. */
+let audioIdleSince = 0;
+function idleAudio(now) {
+  const au = runtime.audio;
+  if (!au || au.ctx.state !== "running") { audioIdleSince = 0; return; }
+  let sounding = state.playing || state.source.playing || state.exporting || state.rendering || state.audioHold;
+  if (!sounding) for (const el of runtime.clipEls.values()) if (!el.paused) { sounding = true; break; }
+  if (sounding) { audioIdleSince = 0; return; }
+  if (!audioIdleSince) audioIdleSince = now;
+  else if (now - audioIdleSince > AUDIO_IDLE_MS) { audioIdleSince = 0; au.ctx.suspend().catch(() => { }); }
+}
+for (const ev of ["pointerdown", "pointermove", "pointerup", "wheel", "keydown", "keyup", "input", "change", "dragover", "drop", "resize"])
+  window.addEventListener(ev, noteActivity, { capture: true, passive: true });
+function frameDue(now) {
+  if (state.exporting) return true;
+  const src = isSourceMode(), fps = projectFps();
+  const key = (src ? "s" : "p") + Math.floor((src ? state.source.time : state.time) * fps + 1e-6);
+  const gap = now - lastActivity < ACTIVE_MS ? 1000 / fps : IDLE_MS;
+  if (key === lastDrawKey && now - lastDrawAt < gap - 1) return false;
+  lastDrawKey = key; lastDrawAt = now;
+  return true;
+}
 function loop(ts) {
   if (lastTs == null) lastTs = ts;
   const dt = Math.min(0.1, (ts - lastTs) / 1000);
@@ -12755,13 +12956,14 @@ function loop(ts) {
     if (px < sc.scrollLeft || px > sc.scrollLeft + sc.clientWidth - 40)
       sc.scrollLeft = Math.max(0, px - 60);
   }
+  const draw = frameDue(ts);
   if (!state.rendering) { // fast export owns media seeking + the canvas
     if (isSourceMode()) {
       syncSourceMedia();
-      drawSourceFrame();
+      if (draw) drawSourceFrame();
     } else {
       syncMedia();
-      drawFrame();
+      if (draw) drawFrame();
     }
   }
   if (state.dirtyTimeline) rebuildClips();
@@ -12770,14 +12972,17 @@ function loop(ts) {
     playheadPx = phX;
     els.playhead.style.left = phX + "px";
   }
-  drawRuler();
-  if (!isSourceMode()) updateSafeOverlay();
-  updateKfGraphs();
-  syncInspectorPlayhead();
-  syncFxEditors();
-  syncColorPlayhead();
+  const rulerKey = `${els.timelineScroll.scrollLeft} ${els.timelineScroll.clientWidth} ${state.pps}`;
+  if (draw || rulerKey !== lastRulerKey) { lastRulerKey = rulerKey; drawRuler(); }
+  if (draw) {
+    if (!isSourceMode()) updateSafeOverlay();
+    updateKfGraphs();
+    syncInspectorPlayhead();
+    syncFxEditors();
+    syncColorPlayhead();
+    updateTimecode(dur);
+  }
   updateMeterUI(dt);
-  updateTimecode(dur);
   if (isSourceMode()) updateSourceScrub();
   if (state.exporting && !state.rendering) {
     const w = exportWindow;
@@ -12787,7 +12992,9 @@ function loop(ts) {
     els.exportProgress.style.width = pct.toFixed(1) + "%";
     els.exportTitle.textContent = `Exporting… ${pct.toFixed(0)}%`;
   }
-  requestAnimationFrame(loop);
+  idleAudio(ts);
+  if (loopBusy(ts)) requestAnimationFrame(loop);
+  else loopSleep = setTimeout(() => { loopSleep = 0; lastTs = null; requestAnimationFrame(loop); }, IDLE_MS);   // a nap is not playback time
 }
 
 /* ═══════════════════════════ EXPORT ═══════════════════════════ */
