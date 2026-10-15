@@ -22,12 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Export decodes video with WebCodecs instead of seeking `<video>`**: about
   5× faster (95.7 s → 18.8 s on a 28 s 720p project) and frame-exact. Files it
   can't decode, and background-removal clips, keep the `<video>` path.
-
-### Fixed
-- **Hardware-encoder profiles pass the export dry run.** It probed a 64×64
-  frame, which NVENC refuses; it now uses 256×144 and reports ffmpeg's reason.
-
-### Changed
 - **Chroma key, temperature, tint and RGB split run on the GPU** (WebGL2), in
   preview and export: a 720p keyed frame went from 113 ms to 3.6 ms (RTX 4090)
   and 123 ms to 12.5 ms (Intel UHD). Output matches the CPU loop within 1–2
@@ -37,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (240×/s on a 240 Hz panel). While paused it drops to 4 fps after 1.5 s idle.
 - **An idle editor sleeps**: the loop slows to a 4 fps timer and the audio
   graph suspends 3 s after the last sound. Idle tab: 83% → 2.2% of a core.
+
+### Fixed
+- **Hardware-encoder profiles pass the export dry run.** It probed a 64×64
+  frame, which NVENC refuses; it now uses 256×144 and reports ffmpeg's reason.
 
 ## [1.14.0] - 2026-10-12
 
