@@ -8676,9 +8676,157 @@ function hexToRgb(hex) {
   const n = parseInt(String(hex).replace("#", ""), 16) || 0;
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
+/* The same pixel loop as a WebGL2 shader: no getImageData read-back and no
+   per-pixel JS, so a keyed or tinted 1080p layer costs a draw call, not ~20 ms
+   of main thread. The input is staged through a 2D canvas exactly as the CPU
+   path draws it (same resize, same cut-out mask, unpremultiplied on upload
+   like getImageData), so both paths see the same pixels; the CPU loop below
+   stays as the fallback when WebGL2 is unavailable. */
+const pixGL = { tried: false, gl: null, canvas: null, loc: null, stage: null, stageCtx: null, outs: new Map() };
+const PIX_VERT = `#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
+const PIX_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform ivec2 uSize;       // picture size: the buffers only grow, so it sits in their top-left corner
+uniform int uSplit;        // RGB split in pixels (R from x+split, B from x−split)
+uniform int uKey;
+uniform vec2 uKeyC;        // key colour Cb, Cr (0…255)
+uniform vec2 uKeyT;        // tolerance t0, t1 (CbCr distance)
+uniform vec2 uShift;       // temperature (R+, B−), tint (G+), in 0…255 units
+out vec4 o;
+void main() {
+  ivec2 sz = uSize;
+  ivec2 q = ivec2(int(gl_FragCoord.x), sz.y - 1 - int(gl_FragCoord.y));   // texture row 0 = top
+  vec4 c = texelFetch(uTex, q, 0);
+  vec3 rgb = c.rgb * 255.0;
+  float a = c.a;
+  if (uSplit > 0) {
+    rgb.r = texelFetch(uTex, ivec2(min(sz.x - 1, q.x + uSplit), q.y), 0).r * 255.0;
+    rgb.b = texelFetch(uTex, ivec2(max(0, q.x - uSplit), q.y), 0).b * 255.0;
+  }
+  if (uKey == 1) {
+    float cb = 128.0 - 0.168736 * rgb.r - 0.331264 * rgb.g + 0.5 * rgb.b;
+    float cr = 128.0 + 0.5 * rgb.r - 0.418688 * rgb.g - 0.081312 * rgb.b;
+    float dist = distance(vec2(cb, cr), uKeyC);
+    if (dist < uKeyT.x) { o = vec4(0.0); return; }
+    if (dist < uKeyT.y) {
+      float k = (dist - uKeyT.x) / (uKeyT.y - uKeyT.x);
+      a *= k;
+      float avg = (rgb.r + rgb.b) * 0.5;   // spill suppression
+      if (rgb.g > avg) rgb.g = rgb.g * k + avg * (1.0 - k);
+    }
+  }
+  rgb += vec3(uShift.x, uShift.y, -uShift.x);
+  rgb = clamp(rgb, 0.0, 255.0) / 255.0;
+  o = vec4(rgb * a, a);
+}`;
+function initPixGL() {
+  if (pixGL.tried) return pixGL.gl;
+  pixGL.tried = true;
+  try {
+    const cv = document.createElement("canvas");
+    const gl = cv.getContext("webgl2", { premultipliedAlpha: true, preserveDrawingBuffer: true, antialias: false, alpha: true });
+    if (!gl) return null;
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, PIX_VERT));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, PIX_FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, "aPos");
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+      [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);   // straight alpha, as getImageData returns it
+    const loc = {};
+    for (const n of ["uTex", "uSize", "uSplit", "uKey", "uKeyC", "uKeyT", "uShift"]) loc[n] = gl.getUniformLocation(prog, n);
+    gl.uniform1i(loc.uTex, 0);
+    cv.addEventListener("webglcontextlost", (e) => { e.preventDefault(); pixGL.gl = null; });
+    cv.addEventListener("webglcontextrestored", () => { pixGL.tried = false; });
+    const stage = document.createElement("canvas");   // GPU-backed: no willReadFrequently
+    Object.assign(pixGL, { gl, canvas: cv, loc, stage, stageCtx: stage.getContext("2d") });
+    return gl;
+  } catch (err) {
+    console.warn("[FableCut] WebGL2 pixel pass unavailable, using the CPU path:", err && err.message);
+    return null;
+  }
+}
+/** pixelPass on the GPU; null when WebGL2 isn't usable (the caller falls back). */
+function pixelPassGL(c, p, src, sx, sy, sw, sh, w, h, dw) {
+  const gl = initPixGL();
+  if (!gl) return null;
+  const { stage, stageCtx: g, canvas: cv, loc } = pixGL;
+  // Resizing a canvas reallocates it, and the layers of one frame differ in
+  // size, so the stage and the GL buffer only grow; each clip gets its own
+  // output canvas at its own size, which keeps its size from frame to frame.
+  if (stage.width < w) stage.width = w;
+  if (stage.height < h) stage.height = h;
+  g.clearRect(0, 0, w, h);
+  g.drawImage(src, sx, sy, sw, sh, 0, 0, w, h);
+  const mask = p.bgRemove ? bgSeg.masks.get(c.id) : null;
+  if (mask && mask.width) {
+    g.globalCompositeOperation = "destination-in";
+    g.drawImage(mask, 0, 0, w, h);
+    g.globalCompositeOperation = "source-over";
+  }
+  const doKey = !!p.chromaKey, temp = +p.temperature || 0, tint = +p.tint || 0;
+  const split = Math.round(clamp(+p.rgbSplit || 0, 0, 60) * (w / Math.max(1, dw)));
+  const run = doKey || temp || tint || split > 0;
+  let out = pixGL.outs.get(c.id);
+  if (!out) {
+    if (pixGL.outs.size >= 32) pixGL.outs.delete(pixGL.outs.keys().next().value);
+    out = document.createElement("canvas");
+    pixGL.outs.set(c.id, out);
+  }
+  if (out.width !== w) out.width = w;
+  if (out.height !== h) out.height = h;
+  const o = out.getContext("2d");
+  o.clearRect(0, 0, w, h);
+  if (!run) { o.drawImage(stage, 0, 0, w, h, 0, 0, w, h); return out; }
+  try {
+    if (cv.width < w) cv.width = w;
+    if (cv.height < h) cv.height = h;
+    gl.viewport(0, 0, w, h);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, stage);
+    gl.uniform2i(loc.uSize, w, h);
+    gl.uniform1i(loc.uSplit, split);
+    gl.uniform1i(loc.uKey, doKey ? 1 : 0);
+    if (doKey) {
+      const [kr, kg, kb] = hexToRgb(p.chromaKey);
+      const t0 = clamp(+p.chromaTolerance || 0, 0, 100) * 1.2;
+      gl.uniform2f(loc.uKeyC, 128 - 0.168736 * kr - 0.331264 * kg + 0.5 * kb, 128 + 0.5 * kr - 0.418688 * kg - 0.081312 * kb);
+      gl.uniform2f(loc.uKeyT, t0, t0 + Math.max(1, clamp(+p.chromaSoftness || 0, 0, 100) * 1.2));
+    }
+    gl.uniform2f(loc.uShift, temp * 0.6, tint * 0.5);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    o.drawImage(cv, 0, cv.height - h, w, h, 0, 0, w, h);   // the viewport is the buffer's bottom-left
+    return out;
+  } catch (err) {
+    if (err && err.name === "SecurityError") throw err;   // tainted source: same as getImageData on the CPU path
+    console.warn("[FableCut] pixel pass failed, using the CPU path:", err && err.message);
+    pixGL.gl = null;
+    return null;
+  }
+}
 function pixelPass(c, p, src, sx, sy, sw, sh, dw, dh) {
   const w = Math.max(2, Math.min(Math.round(dw), 1920));
   const h = Math.max(2, Math.min(Math.round(dh), 1920));
+  const viaGL = pixelPassGL(c, p, src, sx, sy, sw, sh, w, h, dw);
+  if (viaGL) return viaGL;
   if (scratch.width !== w) scratch.width = w;
   if (scratch.height !== h) scratch.height = h;
   scratchCtx.clearRect(0, 0, w, h);

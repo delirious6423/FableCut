@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-cell motion) for agents without vision. Reading a local file by `path=`
   requires the `X-FableCut-Client` header.
 
+### Changed
+- **Chroma key, temperature, tint and RGB split run on the GPU.** The per-pixel
+  pass is a WebGL2 shader now, in preview and export alike, instead of a
+  JavaScript loop over `getImageData`. On a 720p project with keyed and tinted
+  layers a frame went from 55–113 ms to 1–5 ms (RTX 4090 Laptop). Output
+  matches the CPU loop within a level or two; without WebGL2 the CPU loop
+  still runs.
+
 ## [1.14.0] - 2026-10-12
 
 ### Added
