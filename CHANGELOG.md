@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layers a frame went from 55–113 ms to 1–5 ms (RTX 4090 Laptop). Output
   matches the CPU loop within a level or two; without WebGL2 the CPU loop
   still runs.
+- **The editor redraws once per project frame, not once per display refresh.**
+  The main loop ran the whole compositor on every animation frame, playing or
+  paused: 240 times a second on a 240 Hz laptop, so heavy adjustment layers
+  fell behind and an idle editor kept a core busy. It now redraws when the
+  playhead reaches a new frame; while paused, at the project rate for a
+  moment after any input and at 4 fps otherwise.
 
 ## [1.14.0] - 2026-10-12
 

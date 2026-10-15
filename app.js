@@ -1596,7 +1596,7 @@ function projectJSONHere() {
 function listenSSE() {
   const es = new EventSource("/api/events");
   // Named events: "change" = project/media/library; "profiles" = encoding-profiles.json only
-  es.addEventListener("change", () => syncFromServer());
+  es.addEventListener("change", () => { noteActivity(); syncFromServer(); });
   es.addEventListener("export", (e) => {
     try { runExportJob(JSON.parse(e.data)); } catch { }
   });
@@ -12851,6 +12851,25 @@ async function loadProjectFonts() {
 let lastTs = null;
 let exportWindow = null;
 let playheadPx = -1;
+/* The loop runs at the display's refresh rate (240 Hz on some laptops), but
+   the picture only changes once per project frame. Redraw the program
+   monitor and the playhead-driven panels when the playhead reaches a new
+   frame; while paused, at the project rate for a moment after any input
+   (sliders, drags, hover handles) and at 4 fps otherwise, which still picks
+   up late seeks, font loads and agent edits. */
+let lastDrawKey = null, lastDrawAt = 0, lastActivity = 0, lastRulerKey = "";
+function noteActivity() { lastActivity = performance.now(); }
+for (const ev of ["pointerdown", "pointermove", "pointerup", "wheel", "keydown", "keyup", "input", "change", "dragover", "drop", "resize"])
+  window.addEventListener(ev, noteActivity, { capture: true, passive: true });
+function frameDue(now) {
+  if (state.exporting) return true;
+  const src = isSourceMode(), fps = projectFps();
+  const key = (src ? "s" : "p") + Math.floor((src ? state.source.time : state.time) * fps + 1e-6);
+  const gap = now - lastActivity < 1500 ? 1000 / fps : 250;
+  if (key === lastDrawKey && now - lastDrawAt < gap - 1) return false;
+  lastDrawKey = key; lastDrawAt = now;
+  return true;
+}
 function loop(ts) {
   if (lastTs == null) lastTs = ts;
   const dt = Math.min(0.1, (ts - lastTs) / 1000);
@@ -12903,13 +12922,14 @@ function loop(ts) {
     if (px < sc.scrollLeft || px > sc.scrollLeft + sc.clientWidth - 40)
       sc.scrollLeft = Math.max(0, px - 60);
   }
+  const draw = frameDue(ts);
   if (!state.rendering) { // fast export owns media seeking + the canvas
     if (isSourceMode()) {
       syncSourceMedia();
-      drawSourceFrame();
+      if (draw) drawSourceFrame();
     } else {
       syncMedia();
-      drawFrame();
+      if (draw) drawFrame();
     }
   }
   if (state.dirtyTimeline) rebuildClips();
@@ -12918,14 +12938,17 @@ function loop(ts) {
     playheadPx = phX;
     els.playhead.style.left = phX + "px";
   }
-  drawRuler();
-  if (!isSourceMode()) updateSafeOverlay();
-  updateKfGraphs();
-  syncInspectorPlayhead();
-  syncFxEditors();
-  syncColorPlayhead();
+  const rulerKey = `${els.timelineScroll.scrollLeft} ${els.timelineScroll.clientWidth} ${state.pps}`;
+  if (draw || rulerKey !== lastRulerKey) { lastRulerKey = rulerKey; drawRuler(); }
+  if (draw) {
+    if (!isSourceMode()) updateSafeOverlay();
+    updateKfGraphs();
+    syncInspectorPlayhead();
+    syncFxEditors();
+    syncColorPlayhead();
+    updateTimecode(dur);
+  }
   updateMeterUI(dt);
-  updateTimecode(dur);
   if (isSourceMode()) updateSourceScrub();
   if (state.exporting && !state.rendering) {
     const w = exportWindow;
