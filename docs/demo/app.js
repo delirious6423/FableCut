@@ -13378,6 +13378,8 @@ function resetExportCanvases() {
   }
   adjScratch.width = adjScratch.width;
   scratch.width = scratch.width;
+  if (pixGL.stage) pixGL.stage.width = pixGL.stage.width;   // the GPU pixel pass keeps these between frames
+  pixGL.outs.clear();
   exportSnapOff = null;
   exportSnapCtx = null;
 }

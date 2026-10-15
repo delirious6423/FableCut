@@ -17,22 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires the `X-FableCut-Client` header.
 
 ### Changed
-- **Chroma key, temperature, tint and RGB split run on the GPU.** The per-pixel
-  pass is a WebGL2 shader now, in preview and export alike, instead of a
-  JavaScript loop over `getImageData`. On a 720p project with keyed and tinted
-  layers a frame went from 55–113 ms to 1–5 ms (RTX 4090 Laptop). Output
-  matches the CPU loop within a level or two; without WebGL2, or on a software
-  rasterizer such as headless Chrome's SwiftShader, the CPU loop still runs.
-- **The editor redraws once per project frame, not once per display refresh.**
-  The main loop ran the whole compositor on every animation frame, playing or
-  paused: 240 times a second on a 240 Hz laptop, so heavy adjustment layers
-  fell behind and an idle editor kept a core busy. It now redraws when the
-  playhead reaches a new frame; while paused, at the project rate for a
-  moment after any input and at 4 fps otherwise.
-- **An idle editor sleeps.** With nothing playing, the main loop drops from
-  one callback per display refresh to a 4 fps timer (any input or server event
-  wakes it at once), and the audio graph is suspended 3 s after the last
-  sound instead of rendering silence through its worklets forever.
+- **Chroma key, temperature, tint and RGB split run on the GPU** (WebGL2), in
+  preview and export: a 720p keyed frame went from 113 ms to 3.6 ms (RTX 4090)
+  and 123 ms to 12.5 ms (Intel UHD). Output matches the CPU loop within 1–2
+  levels (a few chroma-key edge pixels up to ~11). Without WebGL2, or on a
+  software rasterizer, the CPU loop still runs.
+- **The editor redraws once per project frame**, not on every display refresh
+  (240×/s on a 240 Hz panel). While paused it drops to 4 fps after 1.5 s idle.
+- **An idle editor sleeps**: the loop slows to a 4 fps timer and the audio
+  graph suspends 3 s after the last sound. Idle tab: 83% → 2.2% of a core.
 
 ## [1.14.0] - 2026-10-12
 
