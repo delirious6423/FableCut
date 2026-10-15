@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass is a WebGL2 shader now, in preview and export alike, instead of a
   JavaScript loop over `getImageData`. On a 720p project with keyed and tinted
   layers a frame went from 55–113 ms to 1–5 ms (RTX 4090 Laptop). Output
-  matches the CPU loop within a level or two; without WebGL2 the CPU loop
-  still runs.
+  matches the CPU loop within a level or two; without WebGL2, or on a software
+  rasterizer such as headless Chrome's SwiftShader, the CPU loop still runs.
 - **The editor redraws once per project frame, not once per display refresh.**
   The main loop ran the whole compositor on every animation frame, playing or
   paused: 240 times a second on a 240 Hz laptop, so heavy adjustment layers

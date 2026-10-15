@@ -8732,6 +8732,10 @@ function initPixGL() {
     const cv = document.createElement("canvas");
     const gl = cv.getContext("webgl2", { premultipliedAlpha: true, preserveDrawingBuffer: true, antialias: false, alpha: true });
     if (!gl) return null;
+    // A software rasterizer (SwiftShader in headless Chrome, llvmpipe) runs the
+    // shader on the CPU anyway, no faster than the loop: keep the loop there.
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    if (info && /swiftshader|llvmpipe|softpipe|software/i.test(gl.getParameter(info.UNMASKED_RENDERER_WEBGL))) return null;
     const sh = (type, src) => {
       const s = gl.createShader(type);
       gl.shaderSource(s, src); gl.compileShader(s);
